@@ -456,6 +456,24 @@ class DepModel {
     }
 
     // requires - DepInfo that added current module as a dependency
+    // The build's effective override-compile-option for a module. A module that carries its own
+    // override (the root consumer) uses it; a dependency module (own override empty) inherits the
+    // root consumer's / workspace override, so its subpackages are both gated AND dependency-scanned
+    // with the same cfg the consumer ultimately compiles them with (needed so gated cross-package
+    // imports are seen and cyclic groups are condensed correctly).
+    func effectiveOverrideFor(tomlInfo: TomlInfo): String {
+        if (!tomlInfo.pkg.overrideCompileOption.isEmpty()) {
+            return tomlInfo.pkg.overrideCompileOption
+        }
+        if (COMMON_INFO.inWorkspace && !COMMON_INFO.overrideCompileOption.isEmpty()) {
+            return COMMON_INFO.overrideCompileOption
+        }
+        if (this.depAnalysisEngine.finalDepMap.contains(this.globalConfig.rootName)) {
+            return this.depAnalysisEngine.finalDepMap[this.globalConfig.rootName].tomlInfo.pkg.overrideCompileOption
+        }
+        return ""
+    }
+
     func moduleCheck(path: String, tomlInfo: TomlInfo): BuildCheckResult {
         if (!this.globalConfig.isSkipScript && (path != this.globalConfig.modulePath) &&
             (this.globalConfig.resolveType != RESOLVE_CHECK)) {
@@ -517,7 +535,14 @@ class DepModel {
             .ok ?? return FAILED_BUILD_CHECK_RESULT
 
         tomlInfo.pkg.actualSources = actualSource
-        tomlInfo.pkg.validPkgMap = getAllPkgs(actualSource, tomlInfo.pkg.name)
+        // Opt-in subpackage gating: if the module declares a gating manifest at its
+        // root and the active cfg marks some listed subpackages "off", skip those
+        // subpackages during discovery so their files are never parsed. Modules
+        // without the manifest get an empty skip set and behave exactly as before.
+        let gatedSkipSet = loadGatedSkipSet(path, this.effectiveOverrideFor(tomlInfo))
+        let srcRootPath = getPath(path, tomlInfo.pkg.srcDir.value)
+        tomlInfo.pkg.validPkgMap = getAllPkgs(actualSource, tomlInfo.pkg.name,
+            skipFullNames: gatedSkipSet, srcRootPath: srcRootPath)
 
         let (processSuccess, mockUsedInDependentPackages) = this.processAllPkgs(tomlInfo, features, deducer)
         if (!processSuccess) {
@@ -1139,6 +1164,7 @@ class DepModel {
             }
         }
 
+        let effOverride = this.effectiveOverrideFor(tomlInfo)
         for (pkg in tomlInfo.pkg.validPkgMap) {
             if (!this.globalConfig.isTest && pkg.hasTestFiles && !pkg.hasProdFiles) {
                 continue
@@ -1153,7 +1179,8 @@ class DepModel {
                     pkgInfo.hasTestFiles = pkg.hasTestFiles
                     pkgInfo.features = features
                     pkgInfo.featureDeducer = deducer
-                    let (flag, mockUsed) = runPackageTask(pkgInfo, pkg.timeStamp, directDeps)
+                    let (flag, mockUsed) = runPackageTask(pkgInfo, pkg.timeStamp, directDeps,
+                        overrideCompileOption: effOverride)
                     scanDepSem.release()
                     return (flag, mockUsed)
                 })
@@ -1174,9 +1201,11 @@ class DepModel {
         return (checkSuccessful, mockUsed)
     }
 
-    func runPackageTask(pkgInfo: ResolveItem, timeStamp: Int64, directDeps: HashSet<String>): BuildCheckResult {
+    func runPackageTask(pkgInfo: ResolveItem, timeStamp: Int64, directDeps: HashSet<String>,
+        overrideCompileOption!: String = ""): BuildCheckResult {
 
-        let info = getPackageInfo(pkgInfo.packagePath, pkgInfo.compileOption, pkgInfo.customizedOption, timeStamp) ??
+        let info = getPackageInfo(pkgInfo.packagePath, pkgInfo.compileOption, pkgInfo.customizedOption, timeStamp,
+            overrideCompileOption: overrideCompileOption) ??
             return FAILED_BUILD_CHECK_RESULT
 
         pkgInfo.fullName = info.packageName
@@ -1283,7 +1312,8 @@ class DepModel {
         return true
     }
 
-    func getPackageInfo(pkgSource: CJMPSource, cmdOption: String, customizedMap: HashMap<String, String>, timeStamp: Int64): ?RequiresPackages {
+    func getPackageInfo(pkgSource: CJMPSource, cmdOption: String, customizedMap: HashMap<String, String>, timeStamp: Int64,
+        overrideCompileOption!: String = ""): ?RequiresPackages {
         let errors = ArrayList<String>()
         for (path in pkgSource.allPaths) {
             if (!sourcePathCheck(path)) {
@@ -1308,6 +1338,17 @@ class DepModel {
             if (customizedMap.contains(customizedKey) && customizedMap[customizedKey].contains("--cfg")) {
                 options += " ${customizedMap[customizedKey]}"
             }
+        }
+        // The active `--cfg` may live in the module's override-compile-option, which
+        // governs the real compile. The dependency scan must evaluate conditionally
+        // compiled imports (e.g. `@When`-gated imports) under that same cfg so that
+        // cross-package dependency edges are recorded correctly. `scanDependency`
+        // extracts only the `--cfg` pair from this string, so passing the whole
+        // override option is safe and ignores any other flags it may contain. This is
+        // used only for the scan and is NOT persisted to the package's compile option,
+        // avoiding a duplicate `--cfg` on the real compile command line.
+        if (overrideCompileOption.contains("--cfg")) {
+            options += " ${overrideCompileOption}"
         }
 
         scanPkgInfo(pkgSource, timeStamp, isTest: this.globalConfig.isTest, compileOptions: options)
@@ -1482,7 +1523,19 @@ func constructSource(modulePath: String, srcDir: String, sourceSets: SourceLocat
     }
 }
 
-func getAllPkgs(srcDir: CJMPSource, rootPkgName: String): Array<PackageInfo> {
+// Optional opt-in gating: a module may declare that certain subpackages are
+// conditionally compiled, keyed by a cfg variable. When the active cfg marks a
+// listed subpackage's variable as "off", that subpackage is skipped here at
+// discovery time, so its `.cj` files are never enumerated nor parsed later in
+// scanDependency. The `skipFullNames` set holds the FULL dotted package names of
+// the subpackages to skip; an empty set means "no gating" (default behavior).
+//
+// `srcRootPath` is the canonicalized absolute path of the module's source root
+// (the directory whose package is `rootPkgName`). It is used to derive each
+// discovered subpackage's full dotted name from its directory path, matching the
+// exact naming convention used everywhere else (see `getActualName`).
+func getAllPkgs(srcDir: CJMPSource, rootPkgName: String, skipFullNames!: HashSet<String> = HashSet<String>(),
+    srcRootPath!: String = ""): Array<PackageInfo> {
     var pkgDirQueue = [srcDir]
     var validPkgs = ArrayList<PackageInfo>()
     var pathDepth = 0
@@ -1493,6 +1546,16 @@ func getAllPkgs(srcDir: CJMPSource, rootPkgName: String): Array<PackageInfo> {
             let p = initPackageInfo(pkgDir)
                 .inspectErr { e => println(e) }
                 .ok ?? continue
+            // Gate point: if this discovered subpackage is explicitly listed as
+            // gated-off for the active cfg, skip it (do not add, do not scan). Its
+            // subdirectories still descend below in case a child is enabled.
+            if (!skipFullNames.isEmpty()) {
+                let fullName = deriveFullPkgName(pkgDir, srcRootPath, rootPkgName)
+                if (skipFullNames.contains(fullName)) {
+                    temp = temp |> concat(pkgDir.dirs())
+                    continue
+                }
+            }
             validPkgs.add(p)
             temp = temp |> concat(pkgDir.dirs())
         }
@@ -1503,6 +1566,102 @@ func getAllPkgs(srcDir: CJMPSource, rootPkgName: String): Array<PackageInfo> {
         eprintln("Warning: the module depth of the '${rootPkgName}' is more than 20")
     }
     return validPkgs.toArray()
+}
+
+// Derive the full dotted package name for a discovered source directory, using
+// the same convention as `getActualName`: strip the source-root prefix from the
+// package directory path, then append each remaining path segment as a dotted
+// component of the root package name. The root package itself (path equal to the
+// source root) yields exactly `rootPkgName`.
+func deriveFullPkgName(pkgDir: CJMPSource, srcRootPath: String, rootPkgName: String): String {
+    let paths = pkgDir.allPaths
+    if (paths.size == 0) {
+        return rootPkgName
+    }
+    let packagePath = paths[0].toString()
+    let pkgPath = packagePath.removePrefix(srcRootPath)
+    return getActualName(pkgPath, rootPkgName)
+}
+
+// The manifest file (placed at the module root, next to cjpm.toml) by which a
+// module opts in to subpackage gating. Format:
+//   {"package":"<module>","gated_subpackages":{"<full.subpackage>":"<cfgVar>", ...}}
+const SUBPACKAGE_NAMESPACES_FILE = "subpackage-namespaces.json"
+
+// Parse the `--cfg="name=value, ..."` payload out of an override-compile-option
+// string into a map of cfgVar -> value (e.g. "on"/"off"). Returns an empty map
+// when no `--cfg` is present. Robust to surrounding spaces.
+func parseCfgMap(overrideCompileOption: String): HashMap<String, String> {
+    let result = HashMap<String, String>()
+    // Locate the `--cfg` flag and the quoted payload that follows it.
+    let key = "--cfg"
+    let keyIdx = overrideCompileOption.indexOf(key, 0) ?? return result
+    // Everything after the flag, with leading spaces and an optional '=' removed.
+    var rest = overrideCompileOption[(keyIdx + key.size)..].trimAscii()
+    if (rest.startsWith("=")) {
+        rest = rest.removePrefix("=").trimAscii()
+    }
+    if (rest.isEmpty()) {
+        return result
+    }
+    // The value is normally enclosed in double quotes: --cfg="A=on, B=off".
+    var payload: String
+    if (rest.startsWith("\"")) {
+        let after = rest.removePrefix("\"")
+        let endIdx = after.indexOf("\"", 0) ?? return result
+        payload = after[..endIdx]
+    } else {
+        // Fallback: unquoted single token, read up to the next space.
+        let endIdx = rest.indexOf(" ", 0) ?? rest.size
+        payload = rest[..endIdx]
+    }
+    // Split on commas; each piece is `name=value` with optional spaces.
+    for (pair in payload.split(",")) {
+        let trimmed = pair.trimAscii()
+        if (trimmed.isEmpty()) {
+            continue
+        }
+        let eq = trimmed.indexOf("=", 0) ?? continue
+        let name = trimmed[..eq].trimAscii()
+        let value = trimmed[(eq + 1)..].trimAscii()
+        if (!name.isEmpty()) {
+            result[name] = value
+        }
+    }
+    return result
+}
+
+// Load the gating manifest (if present at the module root) and combine it with
+// the active cfg map to produce the set of FULL package names that must be
+// skipped during discovery. Returns an empty set (no gating) when the module did
+// not opt in (no manifest), when the cfg map is empty, or on any parse error.
+func loadGatedSkipSet(modulePath: String, overrideCompileOption: String): HashSet<String> {
+    let skip = HashSet<String>()
+    let manifestPath = Path(modulePath).join(SUBPACKAGE_NAMESPACES_FILE).toString()
+    // Opt-in guard: without the manifest, behave exactly as before.
+    if (!fileExists(Path(manifestPath))) {
+        return skip
+    }
+    let cfgMap = parseCfgMap(overrideCompileOption)
+    if (cfgMap.isEmpty()) {
+        return skip
+    }
+    try {
+        let text = String.fromUtf8(File.readFrom(manifestPath))
+        let root = (JsonValue.fromStr(text) as JsonObject) ?? return skip
+        let gated = (root.get("gated_subpackages").getOrThrow() as JsonObject) ?? return skip
+        for ((fullName, cfgVarValue) in gated.getFields()) {
+            let cfgVar = ((cfgVarValue as JsonString) ?? continue).getValue()
+            // A subpackage is skipped only when its cfg variable is explicitly "off".
+            if (cfgMap.contains(cfgVar) && cfgMap[cfgVar] == "off") {
+                skip.add(fullName)
+            }
+        }
+    } catch (e: Exception) {
+        // Any malformed manifest disables gating rather than breaking the build.
+        return HashSet<String>()
+    }
+    return skip
 }
 
 func initPackageInfo(pkgDir: CJMPSource): Result<PackageInfo, String> {
