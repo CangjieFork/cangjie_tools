@@ -627,6 +627,11 @@ public class BuildConfig <: CommandConfig {
     public var targetMacroPkgs: HashSet<String> = HashSet<String>() // used by cross compile
     public var targetMacroMods: HashSet<String> = HashSet<String>() // used by cross compile
     public var hasSubPkgs: HashSet<String> = HashSet<String>() // record the lib packages that have subPkgs.
+    // For a module that contains mutually-dependent (cyclic) source packages, maps an SCC leader package
+    // name to the source directories of the OTHER members of its cycle. The leader's compile invocation
+    // adds one extra `-p <dir>` per entry so the whole strongly-connected group is compiled together in a
+    // single cjc call (the compiler supports compiling a cyclic package group at once).
+    public var sccGroupDirs: HashMap<String, ArrayList<String>> = HashMap<String, ArrayList<String>>()
 
     // External config
     public var scriptConfig: ScriptConfig = ScriptConfig()

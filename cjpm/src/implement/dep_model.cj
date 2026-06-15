@@ -58,6 +58,13 @@ class DepModel {
     let scanPkgMtx: Mutex = Mutex()
     // Collect zero indegree packages
     var readyPkgs: ArrayList<String> = ArrayList<String>()
+    // Strongly-connected components of mutually-dependent (cyclic) source packages within this module.
+    // Maps an SCC leader package name to all members of its SCC (including the leader). Only contains
+    // entries for SCCs with more than one member; such a group is compiled together in a single
+    // `cjc -p <m1> -p <m2> ...` invocation (the compiler supports compiling a cyclic package group at once).
+    public var sccGroups: HashMap<String, ArrayList<String>> = HashMap<String, ArrayList<String>>()
+    // Maps every package that belongs to a multi-member SCC to its leader package.
+    public var pkgToSccLeader: HashMap<String, String> = HashMap<String, String>()
     public var targetMacroPkgs: HashSet<String> = HashSet<String>() // used by cross compile
     public var targetMacroMods: HashSet<String> = HashSet<String>() // used by cross compile
 

@@ -54,17 +54,22 @@ func topoSort(topoData: DepModel): Bool {
         return false
     }
 
-    // If there are nodes left unprocessed, it cannot be completed.
+    // If there are nodes left unprocessed, a cycle exists among the module's packages. Rather than
+    // rejecting it (as before), condense each cycle into a strongly-connected component (SCC): the
+    // compiler can compile a group of mutually-dependent source packages together in one invocation.
     dependencyAnalysis(topoData)
     if (topoData.readyPkgs.size != numModules) {
         reverseEdges(topoData)
-        outDegreeAnalysis(topoData)
-        printCyclicDependency(topoData)
-        return false
+        if (!condenseSccsAndReorder(topoData)) {
+            outDegreeAnalysis(topoData)
+            printCyclicDependency(topoData)
+            return false
+        }
     }
 
-    // check if super package is imported by its sub packages
-    // here, we can ensure that no cyclic dep exists
+    // Check that a combined (super) package is not imported by its own sub packages. `edges` may still
+    // contain cycles here (they were condensed into SCCs above rather than rejected), so this must not
+    // assume an acyclic graph; `checkSubPkgDep` tolerates cycles via its `usedPkg` visited guard.
     for (superPkgName in topoData.superPkgMap.keys()) {
         let usedPkg = HashSet<String>()
         for (subPkg in topoData.edges.get(superPkgName) ?? ArrayList<String>()) {
@@ -105,6 +110,155 @@ func retainSourceCodePkg(topoData: DepModel): Unit {
     }
     topoData.readyPkgs = res
     return
+}
+
+// Kosaraju pass 1: DFS on `edges` (dependency -> dependent), append nodes in finish order.
+func sccDfs1(topoData: DepModel, u: String, visited: HashSet<String>, finishOrder: ArrayList<String>): Unit {
+    visited.add(u)
+    for (v in topoData.edges.get(u) ?? ArrayList<String>()) {
+        if (!visited.contains(v)) {
+            sccDfs1(topoData, v, visited, finishOrder)
+        }
+    }
+    finishOrder.add(u)
+    return
+}
+
+// Kosaraju pass 2: DFS on `reverseEdges` (dependent -> dependency), assign SCC id.
+func sccDfs2(topoData: DepModel, u: String, id: Int64, sccIdOf: HashMap<String, Int64>): Unit {
+    sccIdOf[u] = id
+    for (v in topoData.reverseEdges.get(u) ?? ArrayList<String>()) {
+        if (!sccIdOf.contains(v)) {
+            sccDfs2(topoData, v, id, sccIdOf)
+        }
+    }
+    return
+}
+
+// Detect strongly-connected components among the (cyclic) packages and rebuild `readyPkgs` as a valid
+// build order in which every multi-member SCC is represented by a single leader package. The members of
+// each cyclic SCC are recorded in `sccGroups` so the build compiles them together with one
+// `cjc -p <m1> -p <m2> ...` invocation. Returns false if the condensation is somehow still cyclic.
+func condenseSccsAndReorder(topoData: DepModel): Bool {
+    let nodes = ArrayList<String>()
+    for ((name, _) in topoData.indegrees) {
+        nodes.add(name)
+    }
+    sort(nodes, by: cmpStr, stable: true)
+
+    // Kosaraju.
+    let visited = HashSet<String>()
+    let finishOrder = ArrayList<String>()
+    for (n in nodes) {
+        if (!visited.contains(n)) {
+            sccDfs1(topoData, n, visited, finishOrder)
+        }
+    }
+    let sccIdOf = HashMap<String, Int64>()
+    var sccCount: Int64 = 0
+    var idx = finishOrder.size - 1
+    while (idx >= 0) {
+        let n = finishOrder[idx]
+        if (!sccIdOf.contains(n)) {
+            sccDfs2(topoData, n, sccCount, sccIdOf)
+            sccCount += 1
+        }
+        idx -= 1
+    }
+
+    // Group nodes per SCC and choose a deterministic leader (prefer a source package).
+    let sccMembers = HashMap<Int64, ArrayList<String>>()
+    for (n in nodes) {
+        let id = sccIdOf[n]
+        if (!sccMembers.contains(id)) {
+            sccMembers[id] = ArrayList<String>()
+        }
+        sccMembers[id].add(n)
+    }
+    let leaderOf = HashMap<Int64, String>()
+    for ((id, members) in sccMembers) {
+        sort(members, by: cmpStr, stable: true)
+        var leader = members[0]
+        for (m in members) {
+            if (topoData.sourceCodePkgList.contains(m)) {
+                leader = m
+                break
+            }
+        }
+        leaderOf[id] = leader
+        if (members.size > 1) {
+            let group = ArrayList<String>()
+            for (m in members) {
+                group.add(m)
+                topoData.pkgToSccLeader[m] = leader
+            }
+            topoData.sccGroups[leader] = group
+        }
+    }
+
+    // Build the condensation graph (SCC -> SCC) and Kahn-sort it (dependency SCC first).
+    let sccEdges = HashMap<Int64, ArrayList<Int64>>()
+    let sccIndeg = HashMap<Int64, Int64>()
+    for ((id, _) in sccMembers) {
+        sccIndeg[id] = 0
+    }
+    let seenEdge = HashSet<String>()
+    for ((u, dependents) in topoData.edges) {
+        if (!sccIdOf.contains(u)) {
+            continue
+        }
+        let su = sccIdOf[u]
+        for (v in dependents) {
+            if (!sccIdOf.contains(v)) {
+                continue
+            }
+            let sv = sccIdOf[v]
+            if (su == sv) {
+                continue
+            }
+            let key = "${su}->${sv}"
+            if (seenEdge.contains(key)) {
+                continue
+            }
+            seenEdge.add(key)
+            if (!sccEdges.contains(su)) {
+                sccEdges[su] = ArrayList<Int64>()
+            }
+            sccEdges[su].add(sv)
+            sccIndeg[sv] += 1
+        }
+    }
+
+    let queue = ArrayList<Int64>()
+    for ((id, d) in sccIndeg) {
+        if (d == 0) {
+            queue.add(id)
+        }
+    }
+    let orderedSccs = ArrayList<Int64>()
+    while (queue.size != 0) {
+        sort(queue, by: {a: Int64, b: Int64 => leaderOf[a].compare(leaderOf[b])}, stable: true)
+        let cur = queue[0]
+        queue.remove(at: 0)
+        orderedSccs.add(cur)
+        for (w in sccEdges.get(cur) ?? ArrayList<Int64>()) {
+            sccIndeg[w] -= 1
+            if (sccIndeg[w] == 0) {
+                queue.add(w)
+            }
+        }
+    }
+    if (orderedSccs.size != sccMembers.size) {
+        return false
+    }
+
+    // Emit one leader per SCC, in dependency-first order.
+    let newReady = ArrayList<String>()
+    for (id in orderedSccs) {
+        newReady.add(leaderOf[id])
+    }
+    topoData.readyPkgs = newReady
+    return true
 }
 
 // Check the missing packages

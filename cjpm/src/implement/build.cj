@@ -361,6 +361,72 @@ func getResolveData(buildConfig: BuildConfig, tomlInfo: TomlInfo, isScriptDep: B
         }
         resolves.add(dm.packageDepMap[k])
     }
+    // Record the source directory of every non-leader member of each cyclic SCC so the leader's single
+    // compile invocation gets one extra `-p` per member (the whole group is compiled at once).
+    // Each member contributes only its product source set (`_sources.last`); adding every `_sources`
+    // entry would inject several `-p` dirs for a multiplatform member and miscompile it as multiple
+    // packages. The per-package directory lives in CJMPSource `_sources` — ResolveItem.srcDir is only
+    // the module-level src root and is not usable here.
+    for ((leader, members) in dm.sccGroups) {
+        let extraDirs = ArrayList<String>()
+        for (member in members) {
+            if (member == leader) {
+                continue
+            }
+            if (let Some(item) <- dm.packageDepMap.get(member)) {
+                if (let Some(productSource) <- item.packagePath._sources.last) {
+                    let dir = productSource.srcDir.toString()
+                    if (!dir.isEmpty()) {
+                        extraDirs.add(dir)
+                    }
+                }
+            }
+        }
+        if (!extraDirs.isEmpty()) {
+            buildConfig.sccGroupDirs[leader] = extraDirs
+        }
+    }
+    // Make the dependency graph SCC-aware. A cyclic group is compiled into the single artifact the
+    // leader produces (its lib/object contains every member's code), so every reference to a non-leader
+    // member must be redirected to its leader. Without this remap: (a) a downstream importer of a member
+    // truncates in getDepSet and drops the whole group's library at link time, and (b) the leader gets no
+    // build-order edge for dependencies that only a member declares. Skipped entirely (zero cost) when the
+    // module has no cycles.
+    if (!dm.sccGroups.isEmpty()) {
+        // Union each member's external requires and compile options into the leader, since one cjc call
+        // compiles the entire group and therefore needs the whole group's dependencies and flags.
+        for ((leader, members) in dm.sccGroups) {
+            if (let Some(leaderItem) <- dm.packageDepMap.get(leader)) {
+                for (member in members) {
+                    if (member == leader) {
+                        continue
+                    }
+                    if (let Some(memberItem) <- dm.packageDepMap.get(member)) {
+                        for (req in memberItem.requires) {
+                            leaderItem.requires.add(req)
+                        }
+                        if (!memberItem.compileOption.isEmpty()) {
+                            leaderItem.compileOption += " " + memberItem.compileOption
+                        }
+                    }
+                }
+            }
+        }
+        // Redirect every reference to a non-leader member to its leader and drop the now self-referential
+        // intra-group edges. `resolves` holds exactly the packages that are actually built (the leaders);
+        // pkgToSccLeader maps each cyclic member (including the leader itself) to its leader, and other
+        // packages fall back to themselves.
+        for (item in resolves) {
+            let remapped = HashSet<String>()
+            for (req in item.requires) {
+                let target = dm.pkgToSccLeader.get(req) ?? req
+                if (target != item.fullName) {
+                    remapped.add(target)
+                }
+            }
+            item.requires = remapped
+        }
+    }
     buildConfig.binDepMap = dm.binDepMap
     buildConfig.crossBinDepMap = dm.crossBinDepMap
     buildConfig.targetMacroMods = dm.targetMacroMods
@@ -526,6 +592,13 @@ func constructCjcInvocation(compileTask: CompileTask, buildConfig: BuildConfig):
         res.add(obj)
     } else {
         res.add(all: ["-p", compileTask.packagePath])
+        // If this package is the leader of a cyclic strongly-connected group, compile the whole group
+        // together by passing each other member's source directory as an additional `-p`.
+        if (let Some(extraDirs) <- buildConfig.sccGroupDirs.get(compileTask.fullName)) {
+            for (dir in extraDirs) {
+                res.add(all: ["-p", dir])
+            }
+        }
     }
 
     res.add(all: appendImportPaths(compileTask, buildConfig))

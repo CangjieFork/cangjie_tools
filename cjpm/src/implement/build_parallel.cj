@@ -485,10 +485,20 @@ private func registerReadSourceTask(engine: IncrementalEngine, compileTask: Comp
     if (engine.taskContext.taskStorage.contains(id)) {
         return
     }
+    // A cyclic SCC leader's single compile invocation also compiles the group's other members, so their
+    // source directories must contribute to this task's source hash; otherwise editing a member's source
+    // would not invalidate the leader's cache and the stale group output would be kept.
+    let sourceDirs = ArrayList<Path>()
+    sourceDirs.add(Path(compileTask.packagePath))
+    if (let Some(extraDirs) <- buildConfig.sccGroupDirs.get(compileTask.fullName)) {
+        for (dir in extraDirs) {
+            sourceDirs.add(Path(dir))
+        }
+    }
     engine.taskContext.createTask(
         id: id,
         dependencies: [],
-        comp: { => PackageSource(Path(compileTask.packagePath)) },
+        comp: { => PackageSource(sourceDirs) },
         cache: engine.cache
     )
 }
@@ -599,31 +609,58 @@ private func registerMonitorTask(engine: IncrementalEngine, compileTask: Compile
 
 // TASK OUTPUTS
 private struct PackageSource <: Serializable<PackageSource> {
-    PackageSource(
-        let dirpath: Path
-    ) { }
+    // One or more source directories whose `.cj` files contribute to this task's source hash. For an
+    // ordinary package this is a single directory; for a cyclic SCC leader it also includes the source
+    // directories of the group members the leader compiles together (so editing any member triggers a
+    // rebuild). Stored newline-joined; a legacy single-path value deserializes to one directory.
+    let dirpaths: ArrayList<Path>
+
+    public init(dirpath: Path) {
+        dirpaths = ArrayList<Path>()
+        dirpaths.add(dirpath)
+    }
+
+    public init(paths: ArrayList<Path>) {
+        dirpaths = paths
+    }
 
     public func serialize(): DataModel {
-        dirpath.toString().serialize()
+        let parts = ArrayList<String>()
+        for (d in dirpaths) {
+            parts.add(d.toString())
+        }
+        String.join(parts.toArray(), delimiter: "\n").serialize()
     }
 
     public static func deserialize(dm: DataModel): PackageSource {
         let dmstr = dm as DataModelString ?? throw DataModelException("this data is not DataModelString")
-        PackageSource(Path(dmstr.getValue()))
+        let paths = ArrayList<Path>()
+        for (s in dmstr.getValue().split("\n")) {
+            if (!s.isEmpty()) {
+                paths.add(Path(s))
+            }
+        }
+        PackageSource(paths)
     }
 }
 extend PackageSource <: SerializableIncData<PackageSource> {
     public func incHash(): ?Hash {
-        if (exists(dirpath) && FileInfo(canonicalize(dirpath)).isDirectory()) {
-            return Directory.readFrom(dirpath).iterator()
-                .filter { it => it.isRegular() &&
-                    it.name.endsWith(".cj") &&
-                    !it.name.endsWith("_test.cj")
+        let times = ArrayList<DateTime>()
+        var anyDir = false
+        for (dirpath in dirpaths) {
+            if (exists(dirpath) && FileInfo(canonicalize(dirpath)).isDirectory()) {
+                anyDir = true
+                for (it in Directory.readFrom(dirpath).iterator()) {
+                    if (it.isRegular() && it.name.endsWith(".cj") && !it.name.endsWith("_test.cj")) {
+                        times.add(it.lastModificationTime)
+                    }
                 }
-                .map { it => it.lastModificationTime } |>
-                unorderedHash
+            }
         }
-        return None
+        if (!anyDir) {
+            return None
+        }
+        return times.iterator() |> unorderedHash
     }
 }
 
