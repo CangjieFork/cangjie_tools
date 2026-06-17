@@ -1866,6 +1866,36 @@ private func getCompilePackageDesc(compileTask: CompileTask): String {
     }
 }
 
+// The OS process command line is length limited (32767 characters on Windows). A
+// large strongly-connected package group is compiled in a single `cjc` invocation
+// with one `-p` per member plus every transitive `-L`/`-l` dependency, which can
+// exceed that limit and make the spawn fail with "The filename or extension is too
+// long". When the argument list is large, dump it to a response file (one argument
+// per line) and pass `@<file>` instead; `cjc` expands it via its response-file
+// support. On failure to write, fall back to the original arguments unchanged.
+private func maybeRewriteArgsAsResponseFile(compileTask: CompileTask, args: ArrayList<String>): ArrayList<String> {
+    var estimated: Int64 = COMPILE_TOOL.size + 1
+    for (arg in args) {
+        // length + a separating space + up to two surrounding quotes
+        estimated += arg.size + 3
+    }
+    if (estimated < 28000 || compileTask.outLogFile.isEmpty()) {
+        return args
+    }
+    let rspPath = compileTask.outLogFile + ".cjc-args.rsp"
+    let sb = StringBuilder()
+    for (arg in args) {
+        sb.append(arg)
+        sb.append("\n")
+    }
+    if (!writeFile(rspPath, sb.toString(), Write)) {
+        return args
+    }
+    let newArgs = ArrayList<String>()
+    newArgs.add("@" + rspPath)
+    return newArgs
+}
+
 private func callCompiler(compileTask: CompileTask, args: ArrayList<String>, envBuilder: EnvironmentBuilder, buildConfig: BuildConfig): Bool {
     var execCmdFlag: Bool = true
 
@@ -1873,6 +1903,7 @@ private func callCompiler(compileTask: CompileTask, args: ArrayList<String>, env
 
     let env = getVariables()
     let commandStr = getCmdStr(envBuilder.asCliStrings(env), COMPILE_TOOL, args)
+    let execArgs = maybeRewriteArgsAsResponseFile(compileTask, args)
     let pkgDesc = getCompilePackageDesc(compileTask)
     if (buildConfig.isVerbose) {
         let verbose = "Compiling ${pkgDesc}: ${commandStr}\n"
@@ -1894,7 +1925,7 @@ private func callCompiler(compileTask: CompileTask, args: ArrayList<String>, env
     }
 
     try {
-        if (let Some(returnCode) <- execAndToFile(COMPILE_TOOL, args, outFile, errFile, envBuilder: envBuilder, originalEnv: env)) {
+        if (let Some(returnCode) <- execAndToFile(COMPILE_TOOL, execArgs, outFile, errFile, envBuilder: envBuilder, originalEnv: env)) {
             execCmdFlag = (returnCode == 0)
             if (execCmdFlag) {
                 if (buildConfig.globalConfig.isAnalysisCompilePerformance) {
